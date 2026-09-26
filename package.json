@@ -1,0 +1,30 @@
+{
+  "name": "dsh-plugin-zen-runtime",
+  "version": "0.1.0",
+  "description": "Runtime-only fix for the OpenCode Zen free tier in dsh: restores the opencode User-Agent and x-opencode-* identity headers on the wire and appends the bash tool the Zen gateway requires, without patching any file on disk.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "opencode",
+    "zen"
+  ],
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node test/runtime.spec.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
