@@ -16,8 +16,13 @@ const SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const REQUEST_RE = /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 
 const calls = [];
+let failNext = false;
 globalThis.fetch = async (input, init) => {
   calls.push({ input, init });
+  if (failNext) {
+    failNext = false;
+    throw new Error('simulated transport failure');
+  }
   return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
 };
 
@@ -28,6 +33,16 @@ const checks = [];
 function check(label, run) {
   try {
     run();
+    checks.push(`  ok   ${label}`);
+  } catch (error) {
+    checks.push(`  FAIL ${label}\n       ${error.message}`);
+    process.exitCode = 1;
+  }
+}
+
+async function acheck(label, run) {
+  try {
+    await run();
     checks.push(`  ok   ${label}`);
   } catch (error) {
     checks.push(`  FAIL ${label}\n       ${error.message}`);
@@ -146,6 +161,39 @@ check('a row config with a wrong type fails loud', () => {
 
 check('the plugin names the row it mounts under', () => {
   assert.equal(plugin.name, 'zen-runtime');
+});
+
+// --- the Request-input path, which the checks above never reach --------------
+
+/** A Request-form POST, as a caller that builds a Request itself would send it. */
+function opencodeRequest() {
+  return new Request(OPENCODE_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'user-agent': 'deepseek-harness/0.1.7-rc.2' },
+    body: opencodeBody(),
+  });
+}
+
+await acheck('a Request input is rewritten and sent exactly once', async () => {
+  const before = calls.length;
+  const response = await globalThis.fetch(opencodeRequest());
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, before + 1, 'one send per call');
+  const sent = calls[before].input;
+  assert.ok(sent instanceof Request, 'the send must carry the rewritten Request');
+  assert.equal(new Headers(sent.headers).get('user-agent'), 'opencode/1.18.18');
+  const sentTools = JSON.parse(await sent.clone().text()).tools.map((tool) => plugin.toolName(tool));
+  assert.deepEqual(sentTools, ['edit', 'bash', 'read']);
+});
+
+// Regression: the send used to sit inside the same try as the rewriting, so a
+// transport error was caught and the very same POST was sent a second time —
+// unrewritten, without the identity headers or the gateway tools.
+await acheck('a transport failure propagates instead of being retried', async () => {
+  const before = calls.length;
+  failNext = true;
+  await assert.rejects(() => globalThis.fetch(opencodeRequest()), /simulated transport failure/);
+  assert.equal(calls.length, before + 1, 'the request must not be sent a second time');
 });
 
 console.log(checks.join('\n'));
