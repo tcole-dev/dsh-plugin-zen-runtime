@@ -1,62 +1,45 @@
 # dsh-plugin-zen-runtime
 
-让 DSH 能用 **OpenCode ZEN 免费模型**的运行时补丁插件——**不修改磁盘上任何文件**。
+让 DSH（DeepSeek Harness）能用 **OpenCode ZEN 免费模型**的运行时补丁插件——**不修改磁盘上任何文件**。
 
 ```sh
-node test/runtime.spec.mjs        # 18 项自检，零依赖、不联网
+node test/runtime.spec.mjs        # 29 项自检，零依赖、不联网
 ```
+
+> 网关凭什么判定"请求来自 OpenCode"的完整实测记录见
+> [`docs/zen-gateway.md`](docs/zen-gateway.md)。那三项必需条件不是推测，
+> 是抓包加单变量剥离量出来的。
 
 ## 为什么需要它
 
 DSH 内置的 `requestHeaders()` 会先剔除与 attribution 头同名的 provider 头，再把
-attribution 依次覆盖上去。结果是：**provider 里配的 `User-Agent` 永远发不出去**，
-请求只能以 `deepseek-harness/...` 的身份出网，ZEN 网关遂以
-`403 FreeTierError`（"free tier can only be used from within OpenCode"）拒绝。
+attribution 覆盖上去。结果是：**provider 里配的 `User-Agent` 永远发不出去**，请求只能以
+`deepseek-harness/...` 的身份出网。而 ZEN 网关要求 UA 含 `opencode/<版本>`，于是回
+`403 FreeTierError`（"free tier can only be used from within OpenCode"）。
 
 社区已有的 `dsh-plugin-zen-useragent` 靠**改写磁盘文件**解决（替换
-`dsh-llm-pi-ai/lib/index.js` 的 `requestHeaders`、替换 pi-ai 的
-`openai-completions.js`）。这在 **DSH 桌面应用里无法工作**：桌面版把所有包放在
-签名且逐文件校验 SHA-256 的 `app.asar` 内，只读，改不动。
+`dsh-llm-pi-ai/lib/index.js` 的 `requestHeaders`、替换 pi-ai 的 `openai-completions.js`）。
+这在 **DSH 桌面应用里无法工作**：桌面版把所有包放在签名且逐文件校验 SHA-256 的
+`app.asar` 内，只读，改不动。
 
-本插件改在**运行时**拦截：启动时包装一次 `globalThis.fetch`，只对 URL 含
-`opencode` 的请求补上身份与工具，其余请求原样透传。不读、不写、不打补丁，
-因此 **DSH 升级后依然有效**。
+本插件改在**运行时**拦截：启动时包装一次 `globalThis.fetch`，只对白名单主机的请求
+补上身份与工具，其余请求原样透传。不读、不写、不打补丁，因此 **DSH 升级后依然有效**。
 
-## 网关到底校验什么（实测，非推测）
+## 它做了什么
 
-以下结论是把真实 OpenCode 1.18.23 客户端的请求**逐字节抓到**后，在
-`https://opencode.ai/zen/v1/chat/completions` 上**单变量剥离**得到的。被拒时网关返回：
+对目标主机的请求：
 
-```
-403 {"type":"error","error":{"type":"FreeTierError",
-     "message":"OpenCode's free tier can only be used from within OpenCode"}}
-```
+1. 把 `user-agent` 换成 `opencode/<版本>`（若调用方已带 opencode UA 则不动）；
+2. 补上 `x-opencode-client` / `x-opencode-project` / `x-opencode-session` / `x-opencode-request`；
+3. 若 `body.tools` 里缺 `bash` 或 `read`，补上对应的桩工具；
+4. body 被改写时删掉 `content-length`（否则过期长度会让请求挂起）。
 
-| 条件 | 结果 |
-| --- | --- |
-| `User-Agent` 含 `opencode/<版本>`（如 `opencode/1.18.18`） | **必需**；用 DSH 的 attribution UA 一定 403 |
-| `x-opencode-session` = `ses_` + **12 位小写十六进制** + 14 位字母数字 | **必需**；26 位 base32 随机串会 403 |
-| `body.tools` 同时含 `bash` 与 `read` | **必需**；只有 `read`（DSH 原生如此）403，只有 `bash` 也 403 |
-| `x-opencode-client` / `x-opencode-project` / `x-opencode-request` | 非必需（实测去掉仍 200），但真实客户端会发，本插件照样补上 |
-| 系统提示词的内容与长度 | **完全无关**：删掉 64 KB 的 OpenCode 提示词、或压到 18 字符，仍 200 |
-
-> 注意两个常见误判：真实客户端发的头是 `x-opencode-request`，**不存在**
-> `x-opencode-request-id`；而 `x-opencode-ticket` / `x-opencode-directory` /
-> `x-opencode-workspace` 是 opencode **本地服务**用的头，与 ZEN 网关无关。
-
-## 端到端证据
-
-同一个请求（DSH 的 attribution UA + DSH 那套缺 `bash` 的工具集），装/不装本插件：
-
-```
-BEFORE — 未加载插件     403  FreeTierError
-AFTER  — 钩子生效       200  OK(stream)     <- 真实流式回复
-```
+`x-opencode-session` 每进程生成一次并复用，`x-opencode-request` 每请求一条，
+与官方客户端一致；两者的前 12 位都是**小写十六进制**（网关校验这一段）。
 
 ## 装配（以 DSH 桌面应用的 `desktop` profile 为例）
 
-桌面应用的 profile **不能由 `dsh` CLI 管理**（`rejectElectronProfile`），因此手工接线，
-三处改动：
+桌面应用的 profile **不能由 `dsh` CLI 管理**（`rejectElectronProfile`），因此手工接线，三处改动：
 
 1. 包放进 profile 的 `node_modules`（软链即可，改源码后重启生效）：
 
@@ -71,8 +54,8 @@ AFTER  — 钩子生效       200  OK(stream)     <- 真实流式回复
    { "dsh-plugin-zen-runtime": "link:/path/to/dsh-plugin-zen-runtime" }
    ```
 
-3. `~/.dsh/profiles/desktop/cordis.patch.yml` 插一行（本包**不声明
-   `dsh.bundle`**，故意不参与 bundle 叠加，避免被 plugin-manager 对账后出现重复行）：
+3. `~/.dsh/profiles/desktop/cordis.patch.yml` 插一行（本包**不声明 `dsh.bundle`**，
+   故意不参与 bundle 叠加，避免被 plugin-manager 对账后出现重复行）：
 
    ```yaml
    - insert:
@@ -80,8 +63,11 @@ AFTER  — 钩子生效       200  OK(stream)     <- 真实流式回复
          name: dsh-plugin-zen-runtime
    ```
 
-**必须重启 DSH**：bundle 列表与 Loader 行都在进程启动时定格。重启后终端/日志应出现
-`[zen-runtime] fetch hook active — ...`；没有这行就说明行没挂上。
+重启 DSH 后，终端/日志应出现 `[zen-runtime] fetch hook active — ...`；
+没有这行就说明行没挂上。
+
+> bundle 列表与客户端产物在进程启动时定格，改这两类必须重启；本插件没有客户端半，
+> 但行本身是新挂的，所以首次装配要重启一次。
 
 ## provider 配置
 
@@ -111,15 +97,51 @@ ZEN 的 API key 放 DSH 凭据存储（`apiKeyEnv` 指向的名字即可）：
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
-| `userAgent` | `opencode/1.18.18` | 发往 opencode 请求的 `user-agent` |
-| `referer` | `https://opencode.ai` | 仅在请求没有该头时补 |
-| `project` | `global` | `x-opencode-project`；置空字符串则不发送 |
+| `userAgent` | `opencode/1.18.18` | 发往目标主机的 `user-agent`；置空字符串则不改写 |
+| `referer` | `https://opencode.ai` | 仅在请求没有该头时补；置空则不补 |
+| `project` | `global` | `x-opencode-project`；置空则不发送 |
+| `hosts` | `["opencode.ai"]` | 生效主机的白名单；条目同时匹配其子域 |
 | `ensureTools` | `true` | 是否补齐网关要求的 `bash` 与 `read` |
+
+```yaml
+- insert:
+    - id: zen-runtime
+      name: dsh-plugin-zen-runtime
+      config:
+        userAgent: opencode/1.18.23
+        hosts: [opencode.ai, my-gateway.internal]
+```
+
+## 实现要点
+
+- **按 hostname 匹配，不按整串 URL。** 用 `/opencode/i` 匹配整条 URL 会让
+  `https://example.com/?ref=opencode` 这类请求也被注入身份头与工具；白名单只认
+  解析后的主机名。
+- **发送不在改写失败的回退范围内。** 传输错误如实抛给调用方，不会被 catch 后
+  重发一次未经改写的请求。
+- **钩子会重新挂载。** 若有别的库替换或还原了 `globalThis.fetch`，比对 wrapper
+  引用后重新安装，避免静默失效。
+- **零依赖、无服务端代码。** 不读凭据、不落盘、不联网（除被包装的请求本身）。
 
 ## 已知边界
 
-- 只对 URL 含 `opencode` 的请求生效；其余请求的原参数原样转发。
+- 只对 `hosts` 白名单内的主机生效；其余请求的原参数原样转发。
 - 免费额度是按账号/按 IP 计的**每日**限制，与本插件无关；用尽后网关同样会拒绝，
   等到额度重置即可。
-- `x-opencode-session` 每个进程生成一次并复用，`x-opencode-request` 每请求一条——
-  与真实客户端一致。
+- 上游随时可能改变校验策略；那时的失效表现会是重新出现 `403 FreeTierError`。
+- 本插件只作用于 ZEN 目录里零成本的免费模型，凭据仍是你自己的 key。详见
+  [`docs/zen-gateway.md`](docs/zen-gateway.md) 的「边界与风险」。
+
+## 许可
+
+[MIT](LICENSE)。
+
+---
+
+**English.** A runtime-only DSH plugin that makes OpenCode ZEN's free
+(`*-free`) models work in DeepSeek Harness without patching any file on disk.
+It wraps `globalThis.fetch` once per process and, for allow-listed hostnames
+only, restores the `opencode/<version>` user agent, adds the `x-opencode-*`
+identity headers, and appends the `bash`/`read` tool stubs the gateway requires.
+See [`docs/zen-gateway.md`](docs/zen-gateway.md) for the measured evidence
+behind those three requirements. MIT licensed.
