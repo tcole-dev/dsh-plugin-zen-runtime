@@ -89,7 +89,7 @@ check('the attribution user-agent is replaced on opencode requests', () => {
   assert.equal(firstHeaders.get('user-agent'), 'opencode/1.18.18');
 });
 
-check('x-opencode-client is set to cli (required — omitting it is a 403)', () => {
+check('x-opencode-client is set to cli, as the real client does', () => {
   assert.equal(firstHeaders.get('x-opencode-client'), 'cli');
 });
 
@@ -161,6 +161,97 @@ check('a row config with a wrong type fails loud', () => {
 
 check('the plugin names the row it mounts under', () => {
   assert.equal(plugin.name, 'zen-runtime');
+});
+
+// --- hostname allow-list, not a substring match on the whole URL -------------
+
+check('a host that merely mentions opencode is out of scope', () => {
+  assert.equal(plugin.isOpencodeUrl('https://github.com/sst/opencode'), false);
+  assert.equal(plugin.isOpencodeUrl('https://example.com/?ref=opencode'), false);
+  assert.equal(plugin.isOpencodeUrl('https://notopencode.ai/v1'), false);
+  assert.equal(plugin.isOpencodeUrl('https://opencode.ai.evil.test/v1'), false);
+});
+
+check('the gateway host and its subdomains are in scope', () => {
+  assert.equal(plugin.isOpencodeUrl('https://opencode.ai/zen/v1/chat/completions'), true);
+  assert.equal(plugin.isOpencodeUrl('https://api.opencode.ai/v1'), true);
+  assert.equal(plugin.isOpencodeUrl('https://OPENCODE.AI/v1'), true);
+});
+
+check('an unparseable or relative URL is left alone', () => {
+  assert.equal(plugin.isOpencodeUrl('/zen/v1/chat/completions'), false);
+  assert.equal(plugin.isOpencodeUrl('not a url'), false);
+  assert.equal(plugin.isOpencodeUrl('https://opencode.ai/v1', ['other.test']), false);
+});
+
+await acheck('a decoy host is forwarded untouched even though it says opencode', async () => {
+  const before = calls.length;
+  const init = { method: 'POST', body: opencodeBody() };
+  await globalThis.fetch('https://example.com/?ref=opencode', init);
+  assert.equal(calls.length, before + 1);
+  assert.equal(calls[before].init, init, 'the original init object must be forwarded as-is');
+  assert.equal(JSON.parse(init.body).tools.length, 1, 'no gateway tool may be appended');
+});
+
+// --- the hook must re-arm if something replaces fetch ------------------------
+
+await acheck('the hook re-arms after another library replaces globalThis.fetch', async () => {
+  const replaced = globalThis.fetch;
+  const foreignCalls = [];
+  const foreign = async (input, init) => {
+    foreignCalls.push({ input, init });
+    return new Response('foreign', { status: 418 });
+  };
+  globalThis.fetch = foreign;
+  try {
+    plugin.apply(undefined, undefined);
+    assert.notEqual(globalThis.fetch, foreign, 'apply() must re-install over a foreign fetch');
+    const response = await globalThis.fetch(OPENCODE_URL, { method: 'POST', body: opencodeBody() });
+    assert.equal(response.status, 418, 'the foreign fetch stays the transport underneath');
+    assert.equal(foreignCalls.length, 1, 'the re-armed hook must still rewrite and forward once');
+    assert.equal(new Headers(foreignCalls[0].init.headers).get('x-opencode-client'), 'cli');
+  } finally {
+    globalThis.fetch = replaced;
+    plugin.apply(undefined, undefined);
+  }
+});
+
+// --- a rewritten body must not carry the old length --------------------------
+
+await acheck('a stale content-length is dropped when the body grows', async () => {
+  const before = calls.length;
+  await globalThis.fetch(OPENCODE_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'content-length': '42' },
+    body: opencodeBody(),
+  });
+  assert.equal(calls.length, before + 1);
+  assert.equal(headersOf(calls[before]).has('content-length'), false);
+});
+
+await acheck('a content-length is kept when the body is already gateway-ready', async () => {
+  const before = calls.length;
+  const body = JSON.stringify({ tools: [{ function: { name: 'read' } }, { function: { name: 'bash' } }] });
+  await globalThis.fetch(OPENCODE_URL, { method: 'POST', headers: { 'content-length': String(body.length) }, body });
+  assert.equal(calls.length, before + 1);
+  assert.equal(headersOf(calls[before]).get('content-length'), String(body.length));
+});
+
+check('an empty userAgent means "leave the caller\'s own", like referer and project', () => {
+  const supplied = () => new Headers({ 'user-agent': 'deepseek-harness/0.1.7-rc.2' });
+  const blank = plugin.opencodeHeaders(supplied(), {
+    options: { userAgent: '', referer: '', project: '', hosts: ['opencode.ai'] },
+  });
+  assert.equal(blank.get('user-agent'), 'deepseek-harness/0.1.7-rc.2', 'no empty user-agent may be sent');
+  const filled = plugin.opencodeHeaders(supplied(), {
+    options: { userAgent: 'opencode/1.18.18', referer: '', project: '', hosts: ['opencode.ai'] },
+  });
+  assert.equal(filled.get('user-agent'), 'opencode/1.18.18');
+});
+
+check('a row config with a non-array hosts fails loud', () => {
+  assert.throws(() => plugin.resolveOptions({ hosts: 'opencode.ai' }), /config\.hosts must be an array of strings/);
+  assert.throws(() => plugin.resolveOptions({ hosts: [1] }), /config\.hosts must be an array of strings/);
 });
 
 // --- the Request-input path, which the checks above never reach --------------
